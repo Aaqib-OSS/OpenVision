@@ -127,6 +127,9 @@ final class HermesGatewayClient {
     /// OpenVision conversation it belongs to.
     private var runtimeSessionId: String?
     private var runtimeConversation: UUID?
+    /// Invalidates connection/session setup and turns that began before a conversation reset.
+    private var conversationGeneration = 0
+    private var isResettingConversation = false
     /// The turn we're waiting on: armed before prompt.submit, finished by message.complete. `id`
     /// lets a turn's timeout tell itself apart from a later turn in the same session.
     private var turn: (id: UUID, session: String, started: Bool, continuation: CheckedContinuation<String, Error>)?
@@ -142,20 +145,29 @@ final class HermesGatewayClient {
     /// Ask Hermes and return its final answer. Connects, and creates or resumes the OpenVision
     /// session, as needed.
     func ask(_ text: String, imageData: Data?) async throws -> String {
+        let generation = conversationGeneration
+        guard !isResettingConversation else { throw CancellationError() }
         guard let base = HermesDashboard.base(from: settings.hermesDashboardURL),
               OAuthTokenStore.shared.isSignedIn(HermesDashboard.provider(base: base)) else {
             throw HermesGatewayError.notSignedIn
         }
         try await ensureConnected(base: base)
-        var session = try await ensureSession()
+        guard isCurrent(generation) else { throw CancellationError() }
+        var session = try await ensureSession(generation: generation)
 
         do {
-            return try await runTurn(session: session, text: text, imageData: imageData)
+            let answer = try await runTurn(session: session, text: text, imageData: imageData, generation: generation)
+            guard isCurrent(generation) else { throw CancellationError() }
+            return answer
         } catch HermesGatewayError.rpc(code: 4001, _) {
             // The runtime session was reaped (idle, or the backend restarted): resume and retry.
+            guard isCurrent(generation) else { throw CancellationError() }
             runtimeSessionId = nil
-            session = try await ensureSession()
-            return try await runTurn(session: session, text: text, imageData: imageData)
+            session = try await ensureSession(generation: generation)
+            guard isCurrent(generation) else { throw CancellationError() }
+            let answer = try await runTurn(session: session, text: text, imageData: imageData, generation: generation)
+            guard isCurrent(generation) else { throw CancellationError() }
+            return answer
         }
     }
 
@@ -179,7 +191,9 @@ final class HermesGatewayClient {
     /// A turn getting ready to submit (uploading its photo); cleared by an interrupt.
     private var preparingTurn: UUID?
 
-    private func runTurn(session: String, text: String, imageData: Data?) async throws -> String {
+    private func runTurn(session: String, text: String, imageData: Data?, generation: Int? = nil) async throws -> String {
+        let generation = generation ?? conversationGeneration
+        guard isCurrent(generation) else { throw CancellationError() }
         // One turn at a time: a second one would replace the first, whose caller then waits forever.
         guard turn == nil, preparingTurn == nil else { throw HermesGatewayError.busy }
         let turnId = UUID()
@@ -193,7 +207,7 @@ final class HermesGatewayClient {
             ], required: ["session_id", "content_base64"], timeout: 60)
         }
         // Interrupted while the photo uploaded.
-        guard preparingTurn == turnId else { throw CancellationError() }
+        guard preparingTurn == turnId, isCurrent(generation) else { throw CancellationError() }
         preparingTurn = nil
         return try await withCheckedThrowingContinuation { continuation in
             // Checked again: another turn may have started while the image was uploading.
@@ -228,6 +242,10 @@ final class HermesGatewayClient {
             NSLog("[HermesGW] this Hermes has no voice surface, sending the voice note in the prompt")
             return try await call("prompt.submit", ["session_id": session, "text": HermesService.voicePreamble + text], timeout: 30)
         }
+    }
+
+    private func isCurrent(_ generation: Int) -> Bool {
+        !isResettingConversation && generation == conversationGeneration
     }
 
     private func finishTurn(_ result: Result<String, Error>) {
@@ -276,15 +294,38 @@ final class HermesGatewayClient {
         "/restart", "/update", "/yolo", "/approvals", "/quit", "/import", "/reload", "/reload-mcp",
     ]
 
+    /// Stop any active turn before starting a fresh OpenVision and Hermes conversation.
+    @discardableResult
+    func startNewConversation() async -> Bool {
+        guard !isResettingConversation else { return false }
+        conversationGeneration &+= 1
+        isResettingConversation = true
+        defer { isResettingConversation = false }
+
+        // Keep the old runtime identity until its active turn has been interrupted and settled.
+        if turn != nil || preparingTurn != nil {
+            await interrupt()
+        }
+        ConversationManager.shared.startNewConversation()
+        ConversationContext.shared.clear()
+        runtimeSessionId = nil
+        runtimeConversation = nil
+        return true
+    }
+
     /// Run a spoken slash command and return what to say.
     func runSlash(_ spoken: String) async throws -> String {
+        let generation = conversationGeneration
+        guard !isResettingConversation else { throw CancellationError() }
         guard let base = HermesDashboard.base(from: settings.hermesDashboardURL),
               OAuthTokenStore.shared.isSignedIn(HermesDashboard.provider(base: base)) else {
             throw HermesGatewayError.notSignedIn
         }
         try await ensureConnected(base: base)
+        guard isCurrent(generation) else { throw CancellationError() }
         if commandCanon == nil {
             let catalog = try await call("commands.catalog", [:], timeout: 20)
+            guard isCurrent(generation) else { throw CancellationError() }
             commandCanon = catalog.object["canon"] as? [String: String] ?? [:]
         }
         let firstWord = spoken.split(separator: " ").first.map(String.init) ?? spoken
@@ -294,10 +335,9 @@ final class HermesGatewayClient {
         NSLog("[HermesGW] slash %@ (argument: %@)", match.command, match.argument.isEmpty ? "-" : "yes")
 
         if match.command == "/new" {
-            // A new chat, OpenVision's way: a new History conversation gets its own Hermes chat.
-            ConversationManager.shared.startNewConversation()
-            ConversationContext.shared.clear()
-            runtimeSessionId = nil
+            guard await startNewConversation() else {
+                return "A new chat reset is already in progress."
+            }
             return "Started a new chat."
         }
 
@@ -306,14 +346,17 @@ final class HermesGatewayClient {
             let spokenName = match.command.dropFirst()
             guard let askUser else { return "Run /\(spokenName) from Hermes itself." }
             let reply = await askUser("Run \(spokenName) on Hermes? Say yes or no.")
+            guard isCurrent(generation) else { throw CancellationError() }
             guard Self.isYes(reply) else { return "Okay, I didn't run \(spokenName)." }
         }
 
-        let session = try await ensureSession()
+        let session = try await ensureSession(generation: generation)
+        guard isCurrent(generation) else { throw CancellationError() }
         var argument = match.argument
         if match.command == "/model", !argument.isEmpty {
             // Spoken model ids lose their punctuation ("GPT six Luna"): map to a real id.
             let models = await modelIds(session: session)
+            guard isCurrent(generation) else { throw CancellationError() }
             if let id = Self.bestModelMatch(argument, models: models) {
                 NSLog("[HermesGW] model \"%@\" → %@", argument, id)
                 argument = id
@@ -325,6 +368,7 @@ final class HermesGatewayClient {
         var command = argument.isEmpty ? match.command : "\(match.command) \(argument)"
         for _ in 0..<2 {
             let result = try await call("slash.exec", ["session_id": session, "command": command], timeout: 60).object
+            guard isCurrent(generation) else { throw CancellationError() }
             switch result["type"] as? String {
             case "alias":
                 if let target = result["target"] as? String, !target.isEmpty {
@@ -334,7 +378,7 @@ final class HermesGatewayClient {
             case "send", "skill", "prefill":
                 // The command expands into a prompt (skills work this way): run it as a turn.
                 if let message = result["message"] as? String, !message.isEmpty {
-                    return try await runTurn(session: session, text: message, imageData: nil)
+                    return try await runTurn(session: session, text: message, imageData: nil, generation: generation)
                 }
             default:
                 break
@@ -419,7 +463,9 @@ final class HermesGatewayClient {
     /// The Hermes chat for the current OpenVision conversation. Each conversation in History
     /// (a new one starts after a few quiet minutes, or with +) has its own Hermes session, so
     /// Hermes' chat list follows OpenVision's History.
-    private func ensureSession() async throws -> String {
+    private func ensureSession(generation: Int? = nil) async throws -> String {
+        let generation = generation ?? conversationGeneration
+        guard isCurrent(generation) else { throw CancellationError() }
         let conversation = ConversationManager.shared.getOrCreateCurrentConversation()
         if let runtimeSessionId, runtimeConversation == conversation.id { return runtimeSessionId }
         runtimeSessionId = nil
@@ -433,6 +479,7 @@ final class HermesGatewayClient {
                     "inline_images": false,
                 ], required: ["session_id"], timeout: 30)
                 if let id = result.object["session_id"] as? String {
+                    guard isCurrent(generation) else { throw CancellationError() }
                     adopt(id, for: conversation.id)
                     return id
                 }
@@ -443,6 +490,7 @@ final class HermesGatewayClient {
         // No title: Hermes names the chat itself after the first turn, and we add our prefix then
         // (see "session.title" in handleEvent).
         let result = try await callCompatible("session.create", ["source": "openvision"], required: [], timeout: 30)
+        guard isCurrent(generation) else { throw CancellationError() }
         guard let id = result.object["session_id"] as? String else {
             throw HermesGatewayError.turnFailed("no session id")
         }
