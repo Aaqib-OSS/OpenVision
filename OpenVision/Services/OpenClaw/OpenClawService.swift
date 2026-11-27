@@ -85,9 +85,6 @@ final class OpenClawService: ObservableObject {
     private var requestCounter: Int = 0
     private var pendingRequests: [String: CheckedContinuation<OpenClawResponse, Error>] = [:]
     private var receiveTask: Task<Void, Never>?
-    private var activeRunIds: Set<String> = []
-    private var invalidatedRunIds: Set<String> = []
-    private var invalidatedRunOrder: [String] = []
 
     // MARK: - Reconnection
 
@@ -393,18 +390,6 @@ final class OpenClawService: ObservableObject {
     /// Session key for conversation continuity
     private static var sessionKey = "openvision-\(UUID().uuidString.prefix(8))"
 
-    /// Start a distinct gateway conversation for subsequent requests.
-    func startNewConversation() {
-        invalidateActiveRuns()
-        accumulatedResponse = ""
-        isProcessing = false
-        isToolRunning = false
-        currentToolName = nil
-        onProcessingChanged?(false)
-        onToolStatusChanged?(nil, false)
-        Self.sessionKey = "openvision-\(UUID().uuidString.prefix(8))"
-    }
-
     /// Send a text message to the AI agent
     func sendMessage(_ text: String, imageData: Data? = nil) async throws {
         guard connectionState.isUsable else {
@@ -578,39 +563,11 @@ final class OpenClawService: ObservableObject {
     /// Accumulated response text for streaming
     private var accumulatedResponse: String = ""
 
-    private func invalidateRun(_ runId: String) {
-        activeRunIds.remove(runId)
-        guard invalidatedRunIds.insert(runId).inserted else { return }
-        invalidatedRunOrder.append(runId)
-        while invalidatedRunOrder.count > 32 {
-            invalidatedRunIds.remove(invalidatedRunOrder.removeFirst())
-        }
-    }
-
-    private func invalidateActiveRuns() {
-        let runIds = activeRunIds
-        for runId in runIds {
-            invalidateRun(runId)
-        }
-    }
-
     /// Handle event from server
     private func handleEvent(_ event: OpenClawEvent) {
         guard let payload = event.payload else {
             print("[OpenClaw] Event without payload: \(event.event)")
             return
-        }
-
-        if let eventSessionKey = payload["sessionKey"]?.stringValue {
-            // Gateway events may use a canonical agent/session key that ends in our client key.
-            // Ignore only an explicitly different session; metadata can be absent on some events.
-            guard eventSessionKey == Self.sessionKey ||
-                  eventSessionKey.hasSuffix(":\(Self.sessionKey)") else { return }
-        }
-
-        if let runId = payload["runId"]?.stringValue {
-            guard !invalidatedRunIds.contains(runId) else { return }
-            activeRunIds.insert(runId)
         }
 
         switch event.event {
@@ -704,8 +661,7 @@ final class OpenClawService: ObservableObject {
                     print("[OpenClaw] No response text found!")
                 }
 
-                // Retire only this run; another accepted run may already be active.
-                if let runId = payload["runId"]?.stringValue { invalidateRun(runId) }
+                // Reset for next message
                 accumulatedResponse = ""
 
             case "error":
@@ -715,14 +671,12 @@ final class OpenClawService: ObservableObject {
                 print("[OpenClaw] Chat error: \(errorMsg)")
                 lastError = errorMsg
                 onAgentMessage?("Sorry, there was an error: \(errorMsg)")
-                if let runId = payload["runId"]?.stringValue { invalidateRun(runId) }
                 accumulatedResponse = ""
 
             case "aborted":
                 isProcessing = false
                 onProcessingChanged?(false)
                 print("[OpenClaw] Chat aborted")
-                if let runId = payload["runId"]?.stringValue { invalidateRun(runId) }
                 accumulatedResponse = ""
 
             default:

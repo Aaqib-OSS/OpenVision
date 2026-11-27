@@ -36,7 +36,7 @@ final class GeminiLiveService: ObservableObject {
     var onTextReceived: ((String) -> Void)?
     var onAudioReceived: ((Data) -> Void)?
     var onTurnComplete: (() -> Void)?
-    var onInputTranscription: ((String, Bool) -> Void)?
+    var onInputTranscription: ((String) -> Void)?
     var onOutputTranscription: ((String) -> Void)?
     var onConnectionStateChanged: ((AIConnectionState) -> Void)?
     var onDisconnected: (() -> Void)?
@@ -47,11 +47,6 @@ final class GeminiLiveService: ObservableObject {
     private var urlSession: URLSession?
     private var receiveTask: Task<Void, Never>?
     private var isSetupComplete: Bool = false
-    private var pendingInputTranscription = ""
-    private var inputTurnCompleted = false
-    private var lastFinalInputTranscription = ""
-    private var lateInputTranscriptionTask: Task<Void, Never>?
-    private static let inputTranscriptionFinalizationDelay: UInt64 = 600_000_000
 
     // MARK: - Video Throttling
 
@@ -147,14 +142,6 @@ final class GeminiLiveService: ObservableObject {
         onDisconnected?()
     }
 
-    /// Replace the server-side conversation without ending live video mode.
-    func reconnect() async throws {
-        connectionState = .disconnected
-        onConnectionStateChanged?(connectionState)
-        closeWebSocket()
-        try await connect()
-    }
-
     /// Build WebSocket URL
     private func buildWebSocketURL() -> URL {
         var components = URLComponents(string: Constants.GeminiLive.websocketEndpoint)!
@@ -177,11 +164,6 @@ final class GeminiLiveService: ObservableObject {
 
         isSetupComplete = false
         isModelSpeaking = false
-        pendingInputTranscription = ""
-        inputTurnCompleted = false
-        lastFinalInputTranscription = ""
-        lateInputTranscriptionTask?.cancel()
-        lateInputTranscriptionTask = nil
     }
 
     // MARK: - Setup
@@ -266,6 +248,7 @@ final class GeminiLiveService: ObservableObject {
     /// Send audio data to Gemini
     func sendAudio(data: Data) {
         guard connectionState.isUsable, !isModelSpeaking else { return }
+
         let message: [String: Any] = [
             "realtimeInput": [
                 "audio": [
@@ -399,8 +382,7 @@ final class GeminiLiveService: ObservableObject {
         if let inputTranscription = json["inputTranscription"] as? [String: Any],
            let text = inputTranscription["text"] as? String, !text.isEmpty {
             print("[GeminiLive] User said: \(text)")
-            appendInputTranscription(text)
-            if inputTurnCompleted { scheduleLateInputTranscriptionFinish() }
+            onInputTranscription?(text)
             return
         }
 
@@ -427,70 +409,18 @@ final class GeminiLiveService: ObservableObject {
         }
     }
 
-    nonisolated static func mergeInputTranscription(_ current: String, with fragment: String) -> String {
-        guard !fragment.isEmpty else { return current }
-        guard !current.isEmpty else { return fragment }
-        if fragment.hasPrefix(current) { return fragment }
-        if current.hasPrefix(fragment) { return current }
-
-        let maximumOverlap = min(current.count, fragment.count)
-        for overlap in stride(from: maximumOverlap, through: 1, by: -1) {
-            if current.suffix(overlap) == fragment.prefix(overlap) {
-                return current + String(fragment.dropFirst(overlap))
-            }
-        }
-        return current + fragment
-    }
-
-    private func appendInputTranscription(_ fragment: String) {
-        guard !fragment.isEmpty else { return }
-        if pendingInputTranscription.isEmpty && !inputTurnCompleted {
-            lastFinalInputTranscription = ""
-        }
-        pendingInputTranscription = Self.mergeInputTranscription(pendingInputTranscription, with: fragment)
-        onInputTranscription?(pendingInputTranscription, false)
-    }
-
-    private func scheduleLateInputTranscriptionFinish() {
-        lateInputTranscriptionTask?.cancel()
-        lateInputTranscriptionTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: Self.inputTranscriptionFinalizationDelay)
-            guard !Task.isCancelled, let self else { return }
-            self.finishInputTranscription()
-        }
-    }
-
-    private func finishInputTranscription() {
-        lateInputTranscriptionTask?.cancel()
-        lateInputTranscriptionTask = nil
-        let transcript = pendingInputTranscription.trimmingCharacters(in: .whitespacesAndNewlines)
-        pendingInputTranscription = ""
-        inputTurnCompleted = false
-        guard !transcript.isEmpty, transcript != lastFinalInputTranscription else { return }
-        lastFinalInputTranscription = transcript
-        onInputTranscription?(transcript, true)
-    }
-
     /// Handle server content
     private func handleServerContent(_ content: [String: Any]) {
-        if let inputTranscription = content["inputTranscription"] as? [String: Any],
-           let text = inputTranscription["text"] as? String, !text.isEmpty {
-            appendInputTranscription(text)
-            if inputTurnCompleted { scheduleLateInputTranscriptionFinish() }
-        }
-
+        // Check if turn complete
         if content["turnComplete"] as? Bool == true {
-            inputTurnCompleted = true
-            scheduleLateInputTranscriptionFinish()
             isModelSpeaking = false
             isProcessing = false
             onTurnComplete?()
             return
         }
 
+        // Check if interrupted
         if content["interrupted"] as? Bool == true {
-            // Model output interruption does not establish that the user's utterance is complete.
-            // Keep its transcript buffered until the input turn reaches its completion boundary.
             isModelSpeaking = false
             isProcessing = false
             return
@@ -525,6 +455,11 @@ final class GeminiLiveService: ObservableObject {
             }
         }
 
+        // Input transcription
+        if let inputTranscription = content["inputTranscription"] as? [String: Any],
+           let text = inputTranscription["text"] as? String {
+            onInputTranscription?(text)
+        }
     }
 
     /// Handle a tool call from Gemini: run each requested native tool and send the results back as a

@@ -58,6 +58,7 @@ final class VoiceAgentViewModel: ObservableObject {
     /// Prevents duplicate realtime transcripts from resetting the same conversation twice.
     private var isResettingLiveConversation = false
     private var conversationGeneration = 0
+    private var backendTurnGeneration = 0
 
     /// Sentence-streaming TTS (Apple only): how many characters of the streamed reply have
     /// already been handed to the speech queue, and whether a streamed utterance is open.
@@ -760,6 +761,7 @@ final class VoiceAgentViewModel: ObservableObject {
                 guard let self else { return }
                 // In local live video mode replies must flow even if the session timer lapsed
                 // while the user was silently looking around.
+                guard self.backendTurnGeneration == self.conversationGeneration else { return }
                 guard self.isSessionActive || self.isLiveVideoMode else { return }
                 self.aiTranscript = message
                 // Reply text is final. For non-streaming backends this is also the first output
@@ -777,6 +779,7 @@ final class VoiceAgentViewModel: ObservableObject {
             backend.onProcessingChanged = { [weak self] (isProcessing: Bool) in
                 guard let self else { return }
                 if isProcessing {
+                    self.backendTurnGeneration = self.conversationGeneration
                     self.agentState = .thinking
                     // New reply: reset the sentence-streaming cursor for a clean start.
                     self.ttsStreaming = false
@@ -1052,6 +1055,7 @@ final class VoiceAgentViewModel: ObservableObject {
                 print("[VoiceAgent] Photo command on \(backend.backendType.displayName) — capturing...")
                 await captureAndSendPhoto(withPrompt: command)
             } else {
+                backendTurnGeneration = conversationGeneration
                 try await backend.sendMessage(command, imageData: nil)
             }
             // OpenAI, Grok and Hermes are plain request/response with no session to keep "thinking" alive —
@@ -1071,8 +1075,12 @@ final class VoiceAgentViewModel: ObservableObject {
     private func startNewConversation() async {
         guard !isResettingLiveConversation else { return }
         conversationGeneration &+= 1
+        backendTurnGeneration = conversationGeneration
         isResettingLiveConversation = true
         defer { isResettingLiveConversation = false }
+
+        await GemmaLocalService.shared.interrupt()
+        GemmaLocalService.shared.invalidateRoutingCache()
 
         if settingsManager.settings.aiBackend == .hermes,
            settingsManager.settings.hermesAuthMode == .password {
